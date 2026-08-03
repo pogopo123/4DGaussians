@@ -1,3 +1,5 @@
+# Thi nghiem 1: giu nguyen HexPlane, MLP beo gap 4 (net_width 128 -> 512).
+# Moi tham so khac giong het bn_baseline.py.
 ModelHiddenParams = dict(
     kplanes_config = {
      'grid_dimensions': 2,
@@ -5,9 +7,9 @@ ModelHiddenParams = dict(
      'output_coordinate_dim': 16,
      'resolution': [64, 64, 64, 150]
     },
-    multires = [1,2,4,8,16,32],
+    multires = [1,2],
     defor_depth = 0,
-    net_width = 128,
+    net_width = 512,          # <-- bien duy nhat
     plane_tv_weight = 0.0002,
     time_smoothness_weight = 0.001,
     l1_time_planes =  0.0001,
@@ -17,18 +19,14 @@ ModelHiddenParams = dict(
     empty_voxel=False,
     render_process=False,
     static_mlp=False
-
 )
 OptimizationParams = dict(
     dataloader=True,
-    iterations = 15_000,
+    iterations = 15000,
     batch_size=1,
-    coarse_iterations = 3_000,
+    coarse_iterations = 3000,
     densify_until_iter = 10_000,
-    opacity_reset_interval = 100_000,
-    opacity_threshold_coarse = 0.001,
-    opacity_threshold_fine_init = 0.001,
-    opacity_threshold_fine_after = 0.001,
-    opacity_lr = 0.02,
-    # pruning_interval = 2000
+    opacity_threshold_coarse = 0.005,
+    opacity_threshold_fine_init = 0.005,
+    opacity_threshold_fine_after = 0.005,
 )
