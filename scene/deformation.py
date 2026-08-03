@@ -31,8 +31,12 @@ class Deformation(nn.Module):
             self.empty_voxel = DenseGrid(channels=1, world_size=[64,64,64])
         if self.args.static_mlp:
             self.static_mlp = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 1))
-        
+
         self.ratio=0
+        # motion-mask state: mask_warmup=True freezes m_i=1 (warm-up stage);
+        # train.py flips it per-iteration. Default False so eval/render uses the learned mask.
+        self.mask_warmup = False
+        self.motion_out = None
         self.create_net()
     @property
     def get_aabb(self):
@@ -63,6 +67,8 @@ class Deformation(nn.Module):
         self.rotations_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 4))
         self.opacity_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 1))
         self.shs_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 16*3))
+        if getattr(self.args, "motion_mask", False):
+            self.motion_head = nn.Linear(self.W, 1)
 
     def query_time(self, rays_pts_emb, scales_emb, rotations_emb, time_feature, time_emb):
 
@@ -96,28 +102,43 @@ class Deformation(nn.Module):
         return rays_pts_emb[:, :3] + dx
     def forward_dynamic(self,rays_pts_emb, scales_emb, rotations_emb, opacity_emb, shs_emb, time_feature, time_emb):
         hidden = self.query_time(rays_pts_emb, scales_emb, rotations_emb, time_feature, time_emb)
-        if self.args.static_mlp:
+        motion_score = None
+        if getattr(self.args, "motion_mask", False):
+            # soft gate m_i in [0,1]; multiplies the deltas (canonical is kept when m_i -> 0)
+            if self.mask_warmup:
+                motion_score = torch.ones_like(opacity_emb[:,:1])
+            else:
+                motion_score = torch.sigmoid(self.motion_head(hidden))
+            mask = torch.ones_like(opacity_emb[:,0]).unsqueeze(-1)
+        elif self.args.static_mlp:
             mask = self.static_mlp(hidden)
         elif self.args.empty_voxel:
             mask = self.empty_voxel(rays_pts_emb[:,:3])
         else:
             mask = torch.ones_like(opacity_emb[:,0]).unsqueeze(-1)
         # breakpoint()
+        dx = None
         if self.args.no_dx:
             pts = rays_pts_emb[:,:3]
         else:
             dx = self.pos_deform(hidden)
             pts = torch.zeros_like(rays_pts_emb[:,:3])
-            pts = rays_pts_emb[:,:3]*mask + dx
+            if motion_score is not None:
+                pts = rays_pts_emb[:,:3] + motion_score*dx
+            else:
+                pts = rays_pts_emb[:,:3]*mask + dx
         if self.args.no_ds :
-            
+
             scales = scales_emb[:,:3]
         else:
             ds = self.scales_deform(hidden)
 
             scales = torch.zeros_like(scales_emb[:,:3])
-            scales = scales_emb[:,:3]*mask + ds
-            
+            if motion_score is not None:
+                scales = scales_emb[:,:3] + motion_score*ds
+            else:
+                scales = scales_emb[:,:3]*mask + ds
+
         if self.args.no_dr :
             rotations = rotations_emb[:,:4]
         else:
@@ -126,16 +147,21 @@ class Deformation(nn.Module):
             rotations = torch.zeros_like(rotations_emb[:,:4])
             if self.args.apply_rotation:
                 rotations = batch_quaternion_multiply(rotations_emb, dr)
+            elif motion_score is not None:
+                rotations = rotations_emb[:,:4] + motion_score*dr
             else:
                 rotations = rotations_emb[:,:4] + dr
 
         if self.args.no_do :
-            opacity = opacity_emb[:,:1] 
+            opacity = opacity_emb[:,:1]
         else:
-            do = self.opacity_deform(hidden) 
-          
+            do = self.opacity_deform(hidden)
+
             opacity = torch.zeros_like(opacity_emb[:,:1])
-            opacity = opacity_emb[:,:1]*mask + do
+            if motion_score is not None:
+                opacity = opacity_emb[:,:1] + motion_score*do
+            else:
+                opacity = opacity_emb[:,:1]*mask + do
         if self.args.no_dshs:
             shs = shs_emb
         else:
@@ -143,7 +169,13 @@ class Deformation(nn.Module):
 
             shs = torch.zeros_like(shs_emb)
             # breakpoint()
-            shs = shs_emb*mask.unsqueeze(-1) + dshs
+            if motion_score is not None:
+                shs = shs_emb + motion_score.unsqueeze(-1)*dshs
+            else:
+                shs = shs_emb*mask.unsqueeze(-1) + dshs
+
+        if motion_score is not None:
+            self.motion_out = {"score": motion_score, "dx": dx}
 
         return pts, scales, rotations, opacity, shs
     def get_mlp_parameters(self):
@@ -180,6 +212,11 @@ class deform_network(nn.Module):
         self.register_buffer('rotation_scaling_poc', torch.FloatTensor([(2**i) for i in range(scale_rotation_pe)]))
         self.register_buffer('opacity_poc', torch.FloatTensor([(2**i) for i in range(opacity_pe)]))
         self.apply(initialize_weights)
+        if getattr(args, "motion_mask", False):
+            # start the mask near 1 (sigmoid(2.0)~0.88) so switching on the mask
+            # right after warm-up (m frozen at 1) does not shock the deformation field
+            init.zeros_(self.deformation_net.motion_head.weight)
+            init.constant_(self.deformation_net.motion_head.bias, 2.0)
         # print(self)
 
     def forward(self, point, scales=None, rotations=None, opacity=None, shs=None, times_sel=None):

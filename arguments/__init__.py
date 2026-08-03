@@ -103,6 +103,17 @@ class ModelHiddenParams(ParamGroup):
         self.static_mlp=False # useless
         self.apply_rotation=False # useless
 
+        # ---- Motion Mask Head (dynamic/static separation) ----
+        self.motion_mask = False # enable the motion mask head (m_i = sigmoid(W_m h_i + b_m)) gating the deformation deltas
+        self.mask_warmup_iters = 3000 # fine-stage iterations with m_i frozen to 1 (warm-up stage of the 3-stage schedule)
+        self.lambda_motion_sparse = 0.01 # weight of L_sparse = mean(m_i)
+        self.lambda_motion_bind = 0.1 # weight of L_bind = mean|m_i - tanh(gamma*||dx_i||)|
+        self.lambda_motion_smooth = 0.01 # weight of KNN spatial-consistency loss on m_i
+        self.motion_bind_gamma = 10.0 # gamma inside tanh of L_bind
+        self.motion_mask_epsilon = 0.05 # threshold for a point to count as dynamic (logging / inference skip)
+        self.motion_smooth_knn = 8 # neighbours per point for L_smooth
+        self.motion_smooth_sample = 4096 # points sampled per iteration for L_smooth
+
         
         super().__init__(parser, "ModelHiddenParams")
         

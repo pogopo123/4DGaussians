@@ -137,6 +137,12 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
 
         gaussians.update_learning_rate(iteration)
 
+        # 3-stage schedule: coarse (static 3DGS) -> warm-up (deform on, m_i frozen to 1)
+        # -> fine-tune (mask head + sparsity losses active)
+        motion_mask_on = getattr(hyper, "motion_mask", False)
+        if motion_mask_on and stage == "fine":
+            gaussians._deformation.deformation_net.mask_warmup = iteration <= hyper.mask_warmup_iters
+
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
@@ -177,6 +183,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         radii_list = []
         visibility_filter_list = []
         viewspace_point_tensor_list = []
+        motion_out_list = []
         for viewpoint_cam in viewpoint_cams:
             render_pkg = render(viewpoint_cam, gaussians, pipe, background, stage=stage,cam_type=scene.dataset_type)
             image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
@@ -190,6 +197,8 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             radii_list.append(radii.unsqueeze(0))
             visibility_filter_list.append(visibility_filter.unsqueeze(0))
             viewspace_point_tensor_list.append(viewspace_point_tensor)
+            if render_pkg.get("motion_out") is not None:
+                motion_out_list.append(render_pkg["motion_out"])
         
 
         radii = torch.cat(radii_list,0).max(dim=0).values
@@ -212,6 +221,38 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         if opt.lambda_dssim != 0:
             ssim_loss = ssim(image_tensor,gt_image_tensor)
             loss += opt.lambda_dssim * (1.0-ssim_loss)
+
+        # Motion-mask losses (fine-tune stage only, after warm-up)
+        motion_stats = None
+        if stage == "fine" and motion_mask_on and len(motion_out_list) > 0 \
+                and not gaussians._deformation.deformation_net.mask_warmup:
+            sparse_loss = 0.0
+            bind_loss = 0.0
+            for motion_out in motion_out_list:
+                m = motion_out["score"]
+                # L_sparse: push most points towards m=0
+                sparse_loss = sparse_loss + m.mean()
+                # L_bind: tie m to the actual displacement magnitude (stop-grad on dx)
+                if motion_out["dx"] is not None:
+                    dx_norm = motion_out["dx"].detach().norm(dim=-1, keepdim=True)
+                    bind_loss = bind_loss + (m - torch.tanh(hyper.motion_bind_gamma * dx_norm)).abs().mean()
+            sparse_loss = sparse_loss / len(motion_out_list)
+            bind_loss = bind_loss / len(motion_out_list)
+            # L_smooth: KNN spatial consistency on a random subsample
+            m_last = motion_out_list[-1]["score"].squeeze(-1)
+            xyz = gaussians.get_xyz.detach()
+            n_pts = xyz.shape[0]
+            n_sample = min(hyper.motion_smooth_sample, n_pts)
+            sample_idx = torch.randperm(n_pts, device=xyz.device)[:n_sample]
+            sample_xyz = xyz[sample_idx]
+            sample_m = m_last[sample_idx]
+            knn_idx = torch.cdist(sample_xyz, sample_xyz).topk(hyper.motion_smooth_knn + 1, largest=False).indices[:, 1:]
+            smooth_loss = ((sample_m.unsqueeze(-1) - sample_m[knn_idx]) ** 2).mean()
+            loss = loss + hyper.lambda_motion_sparse * sparse_loss \
+                        + hyper.lambda_motion_bind * bind_loss \
+                        + hyper.lambda_motion_smooth * smooth_loss
+            motion_stats = {"sparse": sparse_loss, "bind": bind_loss, "smooth": smooth_loss,
+                            "m": motion_out_list[-1]["score"].detach()}
         # if opt.lambda_lpips !=0:
         #     lpipsloss = lpips_loss(image_tensor,gt_image_tensor,lpips_model)
         #     loss += opt.lambda_lpips * lpipsloss
@@ -241,6 +282,14 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             # Log and save
             timer.pause()
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, [pipe, background], stage, scene.dataset_type)
+            if tb_writer and motion_stats is not None and iteration % 100 == 0:
+                m_vals = motion_stats["m"]
+                tb_writer.add_scalar(f'{stage}/motion/sparse_loss', motion_stats["sparse"].item(), iteration)
+                tb_writer.add_scalar(f'{stage}/motion/bind_loss', motion_stats["bind"].item(), iteration)
+                tb_writer.add_scalar(f'{stage}/motion/smooth_loss', motion_stats["smooth"].item(), iteration)
+                tb_writer.add_scalar(f'{stage}/motion/dynamic_ratio',
+                                     (m_vals > hyper.motion_mask_epsilon).float().mean().item(), iteration)
+                tb_writer.add_histogram(f"{stage}/scene/motion_mask_histogram", m_vals, iteration, max_bins=500)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration, stage)
