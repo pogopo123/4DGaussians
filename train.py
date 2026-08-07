@@ -28,10 +28,26 @@ from utils.timer import Timer
 from utils.loader_utils import FineSampler, get_stamp_list
 import lpips
 from utils.scene_utils import render_training_image
+from utils.flow_utils import flow_consistency_loss, flow_to_image
 from time import time
 import copy
 
 to8b = lambda x : (255*np.clip(x.cpu().numpy(),0,1)).astype(np.uint8)
+
+def safe_add_histogram(tb_writer, tag, values, iteration, **kwargs):
+    """add_histogram that cannot take training down.
+
+    torch 1.13's bundled tensorboard calls np.greater(counts, 0, dtype=np.int32),
+    which numpy >= 1.24 rejects. Fall back to a few summary scalars so the
+    distribution is still observable.
+    """
+    try:
+        tb_writer.add_histogram(tag, values, iteration, **kwargs)
+    except (TypeError, ValueError):
+        v = values.detach().float().flatten()
+        tb_writer.add_scalar(f"{tag}/mean", v.mean().item(), iteration)
+        for q in (0.1, 0.5, 0.9):
+            tb_writer.add_scalar(f"{tag}/p{int(q*100)}", v.quantile(q).item(), iteration)
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -105,7 +121,8 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         load_in_memory = False 
                             # 
     count = 0
-    for iteration in range(first_iter, final_iter+1):        
+    grid_frozen = False
+    for iteration in range(first_iter, final_iter+1):
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -138,10 +155,30 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         gaussians.update_learning_rate(iteration)
 
         # 3-stage schedule: coarse (static 3DGS) -> warm-up (deform on, m_i frozen to 1)
-        # -> fine-tune (mask head + sparsity losses active)
-        motion_mask_on = getattr(hyper, "motion_mask", False)
+        # -> fine-tune (mask head + sparsity/flow losses active)
+        flow_mask_on = getattr(hyper, "flow_mask", False)
+        motion_mask_on = getattr(hyper, "motion_mask", False) or flow_mask_on
         if motion_mask_on and stage == "fine":
             gaussians._deformation.deformation_net.mask_warmup = iteration <= hyper.mask_warmup_iters
+        mask_warmup = motion_mask_on and getattr(
+            gaussians._deformation.deformation_net, "mask_warmup", False)
+
+        # VRAM/stability strategy: once the canonical motion field is in place,
+        # freeze the appearance HexPlane and let only the Flow-HexPlane + MLP
+        # decoders keep learning.
+        freeze_from = getattr(hyper, "freeze_grid_from_iter", 0)
+        if stage == "fine" and freeze_from > 0 and iteration >= freeze_from and not grid_frozen:
+            for p in gaussians._deformation.deformation_net.grid.parameters():
+                p.requires_grad_(False)
+            grid_frozen = True
+            print(f"\n[ITER {iteration}] appearance HexPlane frozen "
+                  f"(flow branch and MLP decoders keep training)")
+
+        # flow-consistency supervision is active after the mask warm-up
+        flow_loss_on = (stage == "fine" and getattr(hyper, "lambda_flow", 0.0) > 0
+                        and not mask_warmup
+                        and iteration > getattr(hyper, "flow_from_iter", 0)
+                        and iteration % max(1, getattr(hyper, "flow_interval", 1)) == 0)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
@@ -184,8 +221,20 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         visibility_filter_list = []
         viewspace_point_tensor_list = []
         motion_out_list = []
+        flow_pkg_list = []
         for viewpoint_cam in viewpoint_cams:
-            render_pkg = render(viewpoint_cam, gaussians, pipe, background, stage=stage,cam_type=scene.dataset_type)
+            # the flow pass costs one extra position-only deformation query plus
+            # one extra rasterization, so only run it when it will be used
+            cam_flow_dt, cam_flow_size = None, None
+            if flow_loss_on and getattr(viewpoint_cam, "flow", None) is not None:
+                cam_flow_dt = viewpoint_cam.flow_dt
+                h_p, w_p = viewpoint_cam.flow.shape[-2:]
+                cam_flow_size = (w_p, h_p)   # render the flow pass at the prior's resolution
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background, stage=stage,cam_type=scene.dataset_type,
+                                flow_dt=cam_flow_dt, flow_size=cam_flow_size)
+            if cam_flow_dt is not None and render_pkg["flow"] is not None:
+                flow_pkg_list.append((render_pkg["flow"], render_pkg["disp3d"],
+                                      render_pkg["motion_out"], viewpoint_cam))
             image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
             images.append(image.unsqueeze(0))
             if scene.dataset_type!="PanopticSports":
@@ -224,16 +273,17 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
 
         # Motion-mask losses (fine-tune stage only, after warm-up)
         motion_stats = None
-        if stage == "fine" and motion_mask_on and len(motion_out_list) > 0 \
-                and not gaussians._deformation.deformation_net.mask_warmup:
+        if stage == "fine" and motion_mask_on and len(motion_out_list) > 0 and not mask_warmup:
             sparse_loss = 0.0
             bind_loss = 0.0
             for motion_out in motion_out_list:
                 m = motion_out["score"]
                 # L_sparse: push most points towards m=0
                 sparse_loss = sparse_loss + m.mean()
-                # L_bind: tie m to the actual displacement magnitude (stop-grad on dx)
-                if motion_out["dx"] is not None:
+                # L_bind: tie m to the actual displacement magnitude (stop-grad on dx).
+                # Superseded by L_flow when the flow branch is on -- keep the weight
+                # at 0 there, it binds m to raw amplitude rather than real motion.
+                if hyper.lambda_motion_bind > 0 and motion_out["dx"] is not None:
                     dx_norm = motion_out["dx"].detach().norm(dim=-1, keepdim=True)
                     bind_loss = bind_loss + (m - torch.tanh(hyper.motion_bind_gamma * dx_norm)).abs().mean()
             sparse_loss = sparse_loss / len(motion_out_list)
@@ -253,6 +303,43 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                         + hyper.lambda_motion_smooth * smooth_loss
             motion_stats = {"sparse": sparse_loss, "bind": bind_loss, "smooth": smooth_loss,
                             "m": motion_out_list[-1]["score"].detach()}
+
+        # Flow-consistency loss: the rendered 2D motion of the Gaussians between
+        # t and t+dt must match the optical-flow prior extracted from the video.
+        # This is what gives the Flow-HexPlane features their meaning -- a point
+        # moving the wrong way pays here, forcing m_i or dx_i to correct.
+        flow_stats = None
+        if len(flow_pkg_list) > 0:
+            flow_loss = 0.0
+            vel_loss = 0.0
+            epe_sum = 0.0
+            cov_sum = 0.0
+            epe_mv_sum = 0.0
+            for flow_map, disp3d, motion_out, cam in flow_pkg_list:
+                fl, epe, cov, epe_mv = flow_consistency_loss(
+                    flow_map, cam.flow.cuda(), cam.flow_valid.cuda(), cam.flow_orig_size,
+                    alpha_threshold=hyper.flow_alpha_threshold,
+                    normalize_alpha=hyper.flow_normalize_alpha)
+                flow_loss = flow_loss + fl
+                epe_sum += epe.item()
+                cov_sum += cov.item()
+                epe_mv_sum += epe_mv.item()
+                # velocity read-out: make the Flow-HexPlane store an explicit
+                # velocity field, supervised by the displacement it produced
+                if hyper.lambda_flow_velocity > 0 and motion_out is not None \
+                        and motion_out.get("velocity") is not None and disp3d is not None:
+                    vel_target = disp3d.detach() / max(cam.flow_dt, 1e-8)
+                    vel_loss = vel_loss + (motion_out["velocity"] - vel_target).abs().mean()
+            n_flow = len(flow_pkg_list)
+            flow_loss = flow_loss / n_flow
+            vel_loss = vel_loss / n_flow if torch.is_tensor(vel_loss) else 0.0
+            loss = loss + hyper.lambda_flow * flow_loss
+            if torch.is_tensor(vel_loss):
+                loss = loss + hyper.lambda_flow_velocity * vel_loss
+            flow_stats = {"flow": flow_loss, "velocity": vel_loss,
+                          "epe_px": epe_sum / n_flow, "coverage": cov_sum / n_flow,
+                          "epe_moving_px": epe_mv_sum / n_flow,
+                          "map": flow_pkg_list[-1][0].detach(), "cam": flow_pkg_list[-1][3]}
         # if opt.lambda_lpips !=0:
         #     lpipsloss = lpips_loss(image_tensor,gt_image_tensor,lpips_model)
         #     loss += opt.lambda_lpips * lpipsloss
@@ -284,12 +371,38 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, [pipe, background], stage, scene.dataset_type)
             if tb_writer and motion_stats is not None and iteration % 100 == 0:
                 m_vals = motion_stats["m"]
-                tb_writer.add_scalar(f'{stage}/motion/sparse_loss', motion_stats["sparse"].item(), iteration)
-                tb_writer.add_scalar(f'{stage}/motion/bind_loss', motion_stats["bind"].item(), iteration)
-                tb_writer.add_scalar(f'{stage}/motion/smooth_loss', motion_stats["smooth"].item(), iteration)
+                # bind_loss stays a plain 0.0 float when lambda_motion_bind == 0
+                as_float = lambda v: v.item() if torch.is_tensor(v) else float(v)
+                tb_writer.add_scalar(f'{stage}/motion/sparse_loss', as_float(motion_stats["sparse"]), iteration)
+                tb_writer.add_scalar(f'{stage}/motion/bind_loss', as_float(motion_stats["bind"]), iteration)
+                tb_writer.add_scalar(f'{stage}/motion/smooth_loss', as_float(motion_stats["smooth"]), iteration)
                 tb_writer.add_scalar(f'{stage}/motion/dynamic_ratio',
                                      (m_vals > hyper.motion_mask_epsilon).float().mean().item(), iteration)
-                tb_writer.add_histogram(f"{stage}/scene/motion_mask_histogram", m_vals, iteration, max_bins=500)
+                safe_add_histogram(tb_writer, f"{stage}/scene/motion_mask_histogram", m_vals, iteration, max_bins=500)
+            if tb_writer and flow_stats is not None and iteration % 100 == 0:
+                tb_writer.add_scalar(f'{stage}/flow/flow_loss', flow_stats["flow"].item(), iteration)
+                tb_writer.add_scalar(f'{stage}/flow/lambda_x_flow_loss',
+                                     hyper.lambda_flow * flow_stats["flow"].item(), iteration)
+                tb_writer.add_scalar(f'{stage}/flow/epe_px', flow_stats["epe_px"], iteration)
+                # the one that separates "motion reconstructed" from "object frozen":
+                # plain epe_px is dominated by static background where both flows are ~0
+                tb_writer.add_scalar(f'{stage}/flow/epe_moving_px', flow_stats["epe_moving_px"], iteration)
+                tb_writer.add_scalar(f'{stage}/flow/coverage', flow_stats["coverage"], iteration)
+                if torch.is_tensor(flow_stats["velocity"]):
+                    tb_writer.add_scalar(f'{stage}/flow/velocity_loss', flow_stats["velocity"].item(), iteration)
+                if iteration % 1000 == 0:
+                    cam = flow_stats["cam"]
+                    w_o, h_o = cam.flow_orig_size
+                    rend = flow_stats["map"]
+                    alpha = rend[2:3].clamp(min=1e-3)
+                    rend_px = (rend[:2] / alpha) * torch.tensor(
+                        [w_o, h_o], device=rend.device).view(2, 1, 1)
+                    # share the colour-wheel scale so the two are comparable
+                    scale = cam.flow.norm(dim=0).flatten().float().quantile(0.99).item()
+                    tb_writer.add_images(f"{stage}/flow/rendered",
+                                         flow_to_image(rend_px, max_mag=scale)[None], global_step=iteration)
+                    tb_writer.add_images(f"{stage}/flow/prior",
+                                         flow_to_image(cam.flow, max_mag=scale)[None], global_step=iteration)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration, stage)
@@ -425,11 +538,11 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     tb_writer.add_scalar(stage+"/"+config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
 
         if tb_writer:
-            tb_writer.add_histogram(f"{stage}/scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
+            safe_add_histogram(tb_writer, f"{stage}/scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
             
             tb_writer.add_scalar(f'{stage}/total_points', scene.gaussians.get_xyz.shape[0], iteration)
             tb_writer.add_scalar(f'{stage}/deformation_rate', scene.gaussians._deformation_table.sum()/scene.gaussians.get_xyz.shape[0], iteration)
-            tb_writer.add_histogram(f"{stage}/scene/motion_histogram", scene.gaussians._deformation_accum.mean(dim=-1)/100, iteration,max_bins=500)
+            safe_add_histogram(tb_writer, f"{stage}/scene/motion_histogram", scene.gaussians._deformation_accum.mean(dim=-1)/100, iteration, max_bins=500)
         
         torch.cuda.empty_cache()
 def setup_seed(seed):

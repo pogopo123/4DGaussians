@@ -18,9 +18,17 @@ class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
                  image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda", time = 0,
-                 mask = None, depth=None
+                 mask = None, depth=None,
+                 flow = None, flow_valid = None, flow_dt = None, flow_orig_size = None
                  ):
         super(Camera, self).__init__()
+
+        # optical-flow prior for this frame: flow [2,h,w] in pixels of
+        # flow_orig_size, valid [h,w], and the time step it spans in model units.
+        self.flow = flow
+        self.flow_valid = flow_valid
+        self.flow_dt = flow_dt
+        self.flow_orig_size = flow_orig_size
 
         self.uid = uid
         self.colmap_id = colmap_id

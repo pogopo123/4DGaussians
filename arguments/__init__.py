@@ -114,7 +114,53 @@ class ModelHiddenParams(ParamGroup):
         self.motion_smooth_knn = 8 # neighbours per point for L_smooth
         self.motion_smooth_sample = 4096 # points sampled per iteration for L_smooth
 
-        
+        # ---- Flow-aware auto-decoder (Flow-HexPlane driving the motion mask) ----
+        self.flow_mask = False # m_i = sigmoid(MLP_flow(f_flow)) from a dedicated Flow-HexPlane (implies motion_mask)
+        self.flow_kplanes_config = {} # plane config of the Flow-HexPlane; empty -> reuse kplanes_config
+        self.flow_multires = [] # multi-resolution of the Flow-HexPlane; empty -> reuse multires
+        self.flow_net_width = 64 # width of the flow decoder MLP (velocity head / pure-flow mask ablation)
+        self.flow_net_depth = 2 # depth of that MLP
+        self.flow_velocity_head = True # extra head decoding an explicit 3D velocity from f_flow
+        self.flow_mask_init_bias = 2.0 # bias of the mask head at init (sigmoid(2.0)~0.88)
+        # Both HexPlanes are queried directly at (x,y,z,t); there is no Fourier
+        # encoding of t. The Flow-HexPlane is supervised straight from the
+        # optical-flow prior, so the extra frequencies are redundant and only
+        # widen the vector the cross-attention has to digest.
+
+        # ---- Cross-Attention fusion (f_fused = LN(f_deform + MHA(Q=f_deform, K=V=f_flow))) ----
+        self.flow_attn = False # merge the geometry and velocity branches with cross-attention
+        self.flow_attn_heads = 4 # attention heads; must divide net_width
+        self.flow_attn_tokens = "multires" # "multires": one Key/Value token per HexPlane scale, so the
+                                           # softmax actually selects a motion scale. "single": the
+                                           # collapsed reference form, where a length-1 softmax makes
+                                           # the block a fixed linear projection of f_flow.
+        self.flow_attn_backbone_depth = 2 # depth of the shared MLP backbone on f_fused
+        self.flow_attn_detach = "query" # "query": detach only the attention Query, so L_rgb keeps
+                                        # training the appearance HexPlane through the residual.
+                                        # "full": detach the whole f_deform (the reference code) --
+                                        # only valid together with freeze_grid_from_iter > 0.
+                                        # "none": no stop-gradient at all.
+        self.mask_from_fused = False # True = m_i reads the fused backbone (the paper diagram).
+                                     # False = m_i stays a function of f_flow alone, which is what
+                                     # makes the early-exit pass worth anything: the mask can then be
+                                     # thresholded before the appearance HexPlane is ever queried.
+                                     # Measured at N=200k, 70% static: -62% deformation time with
+                                     # False, only -15% with True. The deformation heads read the
+                                     # fused feature either way, so the fusion still does its job.
+        self.early_exit = False # inference: skip the deformation of points with m_i <= motion_mask_epsilon
+
+        # ---- Flow-consistency supervision ----
+        self.lambda_flow = 10.0 # weight of L_flow = ||Flow_render - Flow_prior||_1 (replaces L_bind).
+                                # L_flow is in normalized image units (1.0 = full image side), so at
+                                # 2048px width this is ~0.005 of loss per pixel of end-point error.
+        self.lambda_flow_velocity = 0.01 # weight tying the velocity head to the realised displacement
+        self.flow_from_iter = 3000 # fine-stage iteration at which L_flow switches on
+        self.flow_interval = 1 # apply the flow pass every N iterations (>1 trades supervision for speed)
+        self.flow_alpha_threshold = 0.5 # ignore pixels where less than this much alpha accumulated
+        self.flow_normalize_alpha = True # divide the blended flow by the accumulated alpha
+        self.freeze_grid_from_iter = 0 # fine-stage iteration from which the appearance HexPlane is frozen (0 = never)
+
+
         super().__init__(parser, "ModelHiddenParams")
         
 class OptimizationParams(ParamGroup):

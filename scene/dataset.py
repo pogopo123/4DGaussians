@@ -36,9 +36,17 @@ class FourDGSdataset(Dataset):
                 time = caminfo.time
     
                 mask = caminfo.mask
+            # optical-flow prior, when the dataset provides one for this frame
+            flow_kwargs = {}
+            get_flow = getattr(self.dataset, "get_flow", None)
+            if get_flow is not None:
+                entry = get_flow(index)
+                if entry is not None:
+                    flow_kwargs = dict(flow=entry["flow"], flow_valid=entry["valid"],
+                                       flow_dt=entry["dt"], flow_orig_size=entry["orig_size"])
             return Camera(colmap_id=index,R=R,T=T,FoVx=FovX,FoVy=FovY,image=image,gt_alpha_mask=None,
                               image_name=f"{index}",uid=index,data_device=torch.device("cuda"),time=time,
-                              mask=mask)
+                              mask=mask, **flow_kwargs)
         else:
             return self.dataset[index]
     def __len__(self):

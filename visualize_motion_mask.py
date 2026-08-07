@@ -82,11 +82,19 @@ def rasterize(cam, gaussians, bg_color, means3D, scales_raw, rotations_raw, opac
     return image
 
 
-def heat_colors(m):
-    """m in [0,1] -> blue (static) to red (dynamic)."""
-    r = m
-    g = 0.15 * torch.ones_like(m)
-    b = 1.0 - m
+def heat_colors(m, denom=1.0):
+    """m -> blue (static) to red (dynamic).
+
+    `denom` rescales before colouring. With a well-separated mask the raw m
+    already spans [0,1] and denom=1 is right. When L_sparse has crushed the
+    mask (max(m) well under 1) the raw picture is uniformly blue and shows
+    nothing, so passing a high quantile as denom restores the *relative*
+    structure -- at the cost that colour no longer reads as absolute m.
+    """
+    mn = (m / denom).clamp(0.0, 1.0)
+    r = mn
+    g = 0.15 * torch.ones_like(mn)
+    b = 1.0 - mn
     return torch.stack([r, g, b], dim=-1)
 
 
@@ -103,7 +111,8 @@ def spatial_consistency(xyz, m, k=8, n_sample=16384):
 
 
 @torch.no_grad()
-def run(dataset, hyperparam, iteration, epsilon, n_video_frames, cams_mode="video", cam_name=None):
+def run(dataset, hyperparam, iteration, epsilon, n_video_frames, cams_mode="video", cam_name=None,
+        heat_scale="raw", video_scale=0.5):
     gaussians = GaussianModel(dataset.sh_degree, hyperparam)
     scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
     black = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
@@ -134,6 +143,16 @@ def run(dataset, hyperparam, iteration, epsilon, n_video_frames, cams_mode="vide
     print(f"Loaded iteration {scene.loaded_iter}, {gaussians.get_xyz.shape[0]} gaussians, "
           f"{n_total} {cams_mode} cameras")
 
+    # pick the heatmap normaliser once, from the mask at mid-sequence
+    _, _, _, _, _, m_probe = deform_at_time(gaussians, get_cam(n_total // 2).time)
+    if heat_scale == "norm":
+        denom = max(m_probe.quantile(0.999).item(), 1e-6)
+        print(f"heatmap normalised by q99.9(m) = {denom:.4f} "
+              f"(raw max(m) = {m_probe.max().item():.4f}) -- colours are RELATIVE")
+    else:
+        denom = 1.0
+        print(f"heatmap on the raw m scale (max(m) = {m_probe.max().item():.4f})")
+
     # ---------- 1+3+4. still images at 5 timestamps ----------
     all_m = {}
     frac_idx = [int(f * (n_total - 1)) for f in (0.0, 0.25, 0.5, 0.75, 1.0)]
@@ -144,7 +163,7 @@ def run(dataset, hyperparam, iteration, epsilon, n_video_frames, cams_mode="vide
         all_m[t] = m.cpu()
 
         rgb = rasterize(cam, gaussians, bg, mu, s, r, o, shs)
-        heat = rasterize(cam, gaussians, black, mu, s, r, o, shs, colors_precomp=heat_colors(m))
+        heat = rasterize(cam, gaussians, black, mu, s, r, o, shs, colors_precomp=heat_colors(m, denom))
         dyn = rasterize(cam, gaussians, black, mu, s, r, o, shs, point_mask=(m > epsilon))
         stat = rasterize(cam, gaussians, black, mu, s, r, o, shs, point_mask=(m <= epsilon))
 
@@ -186,13 +205,23 @@ def run(dataset, hyperparam, iteration, epsilon, n_video_frames, cams_mode="vide
         cam = get_cam(i)
         mu, s, r, o, shs, m = deform_at_time(gaussians, cam.time)
         rgb = rasterize(cam, gaussians, bg, mu, s, r, o, shs)
-        heat = rasterize(cam, gaussians, black, mu, s, r, o, shs, colors_precomp=heat_colors(m))
+        heat = rasterize(cam, gaussians, black, mu, s, r, o, shs, colors_precomp=heat_colors(m, denom))
         dyn = rasterize(cam, gaussians, black, mu, s, r, o, shs, point_mask=(m > epsilon))
         panels = [rgb, heat, dyn]
         if has_gt:
             panels.insert(0, cam.original_image[:3].cuda())
-        frames.append(np.concatenate([to8b(x).transpose(1, 2, 0) for x in panels], axis=1))
-    imageio.mimwrite(os.path.join(out_dir, f"motion_mask_video_{tag}.mp4"), frames, fps=15)
+        row = np.concatenate([to8b(x).transpose(1, 2, 0) for x in panels], axis=1)
+        if video_scale != 1.0:
+            # four 2048px panels side by side exceed what h264 will encode
+            import PIL.Image
+            h, w = row.shape[:2]
+            row = np.asarray(PIL.Image.fromarray(row).resize(
+                (int(w * video_scale) // 2 * 2, int(h * video_scale) // 2 * 2),
+                PIL.Image.BILINEAR))
+        frames.append(row)
+    vid = os.path.join(out_dir, f"motion_mask_video_{tag}.mp4")
+    imageio.mimwrite(vid, frames, fps=15, quality=8)
+    print(f"video: {vid}  ({len(frames)} frames, {frames[0].shape[1]}x{frames[0].shape[0]})")
 
     # ---------- post-hoc TensorBoard events (motion_histogram over time) ----------
     try:
@@ -230,6 +259,10 @@ if __name__ == "__main__":
                         help="camera set to render from (train/test include a GT panel)")
     parser.add_argument("--cam_name", default=None, type=str,
                         help="restrict train/test rendering to one physical camera, e.g. cam01")
+    parser.add_argument("--heat_scale", default="raw", choices=["raw", "norm"],
+                        help="'norm' rescales the heatmap by q99.9(m); use it when the mask "
+                             "has collapsed and the raw picture is uniformly blue")
+    parser.add_argument("--video_scale", default=0.5, type=float)
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--configs", type=str)
     args = get_combined_args(parser)
@@ -243,4 +276,6 @@ if __name__ == "__main__":
     if epsilon is None:
         epsilon = getattr(args, "motion_mask_epsilon", 0.05)
     run(model.extract(args), hyperparam.extract(args), args.iteration, epsilon, args.n_video_frames,
-        cams_mode=getattr(args, "cams", "video"), cam_name=getattr(args, "cam_name", None))
+        cams_mode=getattr(args, "cams", "video"), cam_name=getattr(args, "cam_name", None),
+        heat_scale=getattr(args, "heat_scale", "raw"),
+        video_scale=getattr(args, "video_scale", 0.5))

@@ -14,8 +14,9 @@ import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
+from utils.flow_utils import screen_flow
 from time import time as get_time
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, stage="fine", cam_type=None):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, stage="fine", cam_type=None, flow_dt=None, flow_size=None):
     """
     Render the scene. 
     
@@ -134,10 +135,44 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     motion_out = None
     if "fine" in stage:
         motion_out = getattr(pc._deformation.deformation_net, "motion_out", None)
+
+    # ---- Flow pass ----------------------------------------------------------
+    # A second rasterization whose "colour" is the screen-space displacement of
+    # each Gaussian between t and t+flow_dt. Channel 2 carries a constant 1 so
+    # that, against a black background, it comes back as the accumulated alpha.
+    # `flow_size` renders it straight at the flow prior's resolution: the frustum
+    # (and hence the NDC projection) is unchanged, only the pixel grid shrinks,
+    # which is both much cheaper and closer to how the prior was produced -- RAFT
+    # ran on downsampled images too.
+    flow_map = None
+    disp3d = None
+    if flow_dt is not None and "fine" in stage:
+        time_next = time + flow_dt
+        means3D_next = pc._deformation.forward_position(means3D, time_next)
+        disp3d = means3D_next - means3D_final
+        flow_2d = screen_flow(means3D_final, means3D_next, raster_settings.projmatrix)
+        flow_colors = torch.cat([flow_2d, torch.ones_like(flow_2d[:, :1])], dim=-1)
+        flow_raster_settings = raster_settings._replace(bg=torch.zeros_like(raster_settings.bg))
+        if flow_size is not None:
+            flow_raster_settings = flow_raster_settings._replace(
+                image_width=int(flow_size[0]), image_height=int(flow_size[1]))
+        flow_rasterizer = GaussianRasterizer(raster_settings=flow_raster_settings)
+        flow_map, _, _ = flow_rasterizer(
+            means3D = means3D_final,
+            means2D = torch.zeros_like(screenspace_points),
+            shs = None,
+            colors_precomp = flow_colors,
+            opacities = opacity,
+            scales = scales_final,
+            rotations = rotations_final,
+            cov3D_precomp = cov3D_precomp)
+
     return {"render": rendered_image,
             "viewspace_points": screenspace_points,
             "visibility_filter" : radii > 0,
             "radii": radii,
             "depth":depth,
-            "motion_out": motion_out}
+            "motion_out": motion_out,
+            "flow": flow_map,
+            "disp3d": disp3d}
 

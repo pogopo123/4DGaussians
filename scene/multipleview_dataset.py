@@ -6,6 +6,7 @@ from utils.graphics_utils import focal2fov
 from scene.colmap_loader import qvec2rotmat
 from scene.dataset_readers import CameraInfo
 from scene.neural_3D_dataset_NDC import get_spiral
+from utils.flow_utils import FlowPriorStore
 from torchvision import transforms as T
 
 
@@ -26,34 +27,58 @@ class multipleview_dataset(Dataset):
         self.image_paths, self.image_poses, self.image_times= self.load_images_path(cam_folder, cam_extrinsics,cam_intrinsics,split)
         if split=="test":
             self.video_cam_infos=self.get_video_cam_infos(cam_folder)
-        
-    
+
+        # optical-flow prior (written by scripts/precompute_flow.py); silently
+        # disabled when the folder is absent, so unmodified runs are unaffected.
+        self.flow_store = FlowPriorStore(os.path.join(cam_folder, "flow"))
+        self.flow_dt = (self.flow_store.gap / float(self.image_length)
+                        if self.flow_store.enabled else None)
+
     def load_images_path(self, cam_folder, cam_extrinsics,cam_intrinsics,split):
         image_length = len(os.listdir(os.path.join(cam_folder,"cam01")))
+        self.image_length = image_length
         #len_cam=len(cam_extrinsics)
         image_paths=[]
         image_poses=[]
         image_times=[]
+        # (camera folder name, 0-based frame index) per entry, so the flow prior
+        # can be looked up by dataset index.
+        self.image_cams=[]
+        self.image_frames=[]
         for idx, key in enumerate(cam_extrinsics):
             extr = cam_extrinsics[key]
             R = np.transpose(qvec2rotmat(extr.qvec))
             T = np.array(extr.tvec)
 
             number = os.path.basename(extr.name)[5:-4]
-            images_folder=os.path.join(cam_folder,"cam"+number.zfill(2))
+            cam_name="cam"+number.zfill(2)
+            images_folder=os.path.join(cam_folder,cam_name)
 
             image_range=range(image_length)
             if split=="test":
                 image_range = [image_range[0],image_range[int(image_length/3)],image_range[int(image_length*2/3)]]
 
-            for i in image_range:    
+            for i in image_range:
                 num=i+1
                 image_path=os.path.join(images_folder,"frame_"+str(num).zfill(5)+".jpg")
                 image_paths.append(image_path)
                 image_poses.append((R,T))
                 image_times.append(float(i/image_length))
+                self.image_cams.append(cam_name)
+                self.image_frames.append(i)
 
         return image_paths, image_poses,image_times
+
+    def get_flow(self, index):
+        """-> dict(flow, valid, dt, orig_size) for this frame, or None."""
+        if not self.flow_store.enabled:
+            return None
+        entry = self.flow_store.get(self.image_cams[index], self.image_frames[index])
+        if entry is None:
+            return None
+        flow, valid = entry
+        return {"flow": flow, "valid": valid, "dt": self.flow_dt,
+                "orig_size": self.flow_store.orig_size}
     
     def get_video_cam_infos(self,datadir):
         poses_arr = np.load(os.path.join(datadir, "poses_bounds_multipleview.npy"))
