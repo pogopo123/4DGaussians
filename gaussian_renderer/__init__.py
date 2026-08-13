@@ -147,10 +147,19 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     flow_map = None
     disp3d = None
     if flow_dt is not None and "fine" in stage:
+        # In flow_split mode the two passes see different graphs: the RGB pass may
+        # detach the kinematic head, and here the appearance attributes are detached
+        # so L_flow reaches the flow branch and nothing else.
+        split = getattr(pc._deformation.deformation_net, "split_out", None)
+        base = split["pos_flow"] if split is not None else means3D_final
+        scales_fp = scales_final.detach() if split is not None else scales_final
+        rot_fp = rotations_final.detach() if split is not None else rotations_final
+        op_fp = opacity.detach() if split is not None else opacity
+
         time_next = time + flow_dt
         means3D_next = pc._deformation.forward_position(means3D, time_next)
-        disp3d = means3D_next - means3D_final
-        flow_2d = screen_flow(means3D_final, means3D_next, raster_settings.projmatrix)
+        disp3d = means3D_next - base
+        flow_2d = screen_flow(base, means3D_next, raster_settings.projmatrix)
         flow_colors = torch.cat([flow_2d, torch.ones_like(flow_2d[:, :1])], dim=-1)
         flow_raster_settings = raster_settings._replace(bg=torch.zeros_like(raster_settings.bg))
         if flow_size is not None:
@@ -158,13 +167,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 image_width=int(flow_size[0]), image_height=int(flow_size[1]))
         flow_rasterizer = GaussianRasterizer(raster_settings=flow_raster_settings)
         flow_map, _, _ = flow_rasterizer(
-            means3D = means3D_final,
+            means3D = base,
             means2D = torch.zeros_like(screenspace_points),
             shs = None,
             colors_precomp = flow_colors,
-            opacities = opacity,
-            scales = scales_final,
-            rotations = rotations_final,
+            opacities = op_fp,
+            scales = scales_fp,
+            rotations = rot_fp,
             cov3D_precomp = cov3D_precomp)
 
     return {"render": rendered_image,

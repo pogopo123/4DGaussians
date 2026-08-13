@@ -1,0 +1,142 @@
+"""F3GS-pure -- mỗi HexPlane học đúng MỘT hàm loss.
+
+    App-HexPlane   <- L_rgb  (photometric)                -> ds, dq, dopacity, dSH
+    Flow-HexPlane  <- L_flow (optical flow GT vs dự đoán)  -> dx
+
+Khác f3gs_split ở đúng hai chỗ:
+
+1. flow_split_detach_rgb=True -- dx bị detach ở lượt RGB, nên L_rgb KHÔNG còn
+   đường nào tới Flow-HexPlane. Ở f3gs_split nó vẫn tới được (chỉ L_flow bị chặn
+   khỏi App-HexPlane), nên chưa phải tách tuyệt đối.
+
+2. flow_split_heads='x' -- dq chuyển sang nhánh app. Bắt buộc: L_flow mù với phép
+   xoay vì bản đồ flow dựng từ TÂM Gaussian, nên nếu dq ở nhánh flow mà L_rgb bị
+   detach thì nó không nhận gradient từ đâu cả và sẽ đứng yên ở init.
+
+flow_grid_tv=True: Flow-HexPlane giờ mang trường dịch chuyển một mình, mà optical
+flow prior chỉ phủ ~1.8% pixel có chuyển động thật -- phần còn lại của trường
+không có ràng buộc nào. TV/smoothness bù vào chỗ đó.
+
+RỦI RO đã biết: chuyển động ở vùng flow thiếu hoặc sai (coverage 94%) giờ chỉ còn
+TV giữ, không còn L_rgb. Đây chính là biến mà run này đo.
+"""
+
+ModelHiddenParams = dict(
+    # ---- appearance HexPlane (unchanged) ----
+    kplanes_config = {
+     'grid_dimensions': 2,
+     'input_coordinate_dim': 4,
+     'output_coordinate_dim': 16,
+     'resolution': [64, 64, 64, 150]
+    },
+    multires = [1,2,4,8,16,32],
+    defor_depth = 0,
+    net_width = 128,
+    plane_tv_weight = 0.0002,
+    time_smoothness_weight = 0.001,
+    l1_time_planes =  0.0001,
+    no_do=False,
+    no_dshs=False,
+    no_ds=False,
+    empty_voxel=False,
+    render_process=False,
+    static_mlp=False,
+
+    # ---- Flow-HexPlane (latent velocity field) ----
+    # Asymmetric resolution on purpose: a velocity field is far lower-frequency
+    # in space than radiance, so fewer scales and a narrower feature keep the
+    # extra VRAM at roughly a tenth of the appearance grid -- and the reduced
+    # spatial capacity doubles as a natural smoothness prior on motion.
+    flow_mask = True,
+    flow_kplanes_config = {
+     'grid_dimensions': 2,
+     'input_coordinate_dim': 4,
+     'output_coordinate_dim': 16,
+     'resolution': [64, 64, 64, 150]
+    },
+    flow_multires = [1,2,4,8,16,32],   # bằng App-HexPlane: dx/dq cần capacity của một
+                                       # trường dịch chuyển, không phải của một mask
+    flow_net_width = 64,
+    flow_net_depth = 2,
+    flow_velocity_head = False,
+    flow_split = True,
+    flow_split_ctx = True,        # nhánh flow đọc sg(f_app) làm ngữ cảnh
+    flow_split_detach_rgb = True,   # L_rgb KHONG toi Flow-HexPlane
+    flow_split_heads = 'x',         # dq sang nhanh app (L_flow mu voi xoay)
+    flow_grid_tv = True,            # TV cho ca Flow-HexPlane
+    flow_mask_init_bias = 2.0,
+
+    # ---- Cross-Attention fusion ----
+    # f_fused = LayerNorm( f_deform + MHA(Q=f_deform, K=V=f_flow_tokens) )
+    flow_attn = False,            # split thay thế hoàn toàn
+    flow_attn_heads = 4,           # must divide net_width (128 / 4 = 32)
+    flow_attn_tokens = 'multires', # one token per Flow-HexPlane scale, so the softmax has
+                                   # a real choice to make. 'single' reproduces the reference
+                                   # code, where a length-1 softmax degenerates the block into
+                                   # a fixed linear projection of f_flow.
+    flow_attn_backbone_depth = 2,
+    flow_attn_detach = 'query',    # detach only the Query: L_flow cannot steer the appearance
+                                   # planes through the attention weights, but L_rgb still trains
+                                   # them through the residual. Set to 'full' (the reference code)
+                                   # ONLY together with freeze_grid_from_iter > 0 -- otherwise the
+                                   # appearance HexPlane receives no gradient at all.
+    mask_from_fused = False,       # Where m_i is read from, and the one place this config knowingly
+                                   # departs from the paper diagram.
+                                   #   True  = m_i from the fused backbone, as drawn. The mask sees
+                                   #           geometry as well as motion, but deciding who is static
+                                   #           then requires the App-HexPlane AND the attention for
+                                   #           every point -- together ~2/3 of the deformation cost --
+                                   #           so early-exit only saves the head MLPs (measured -15%).
+                                   #   False = m_i from f_flow alone. The Flow-HexPlane costs 1.9 ms
+                                   #           against the appearance grid's 12.0 ms, so the mask can
+                                   #           be thresholded first and the appearance grid +
+                                   #           attention + heads run on the dynamic subset only
+                                   #           (measured -62% at 70% static, N=200k -- which lands
+                                   #           28% BELOW plain 4DGS while still carrying the whole
+                                   #           flow branch).
+                                   # The deformation heads read f_fused in both cases, so the
+                                   # cross-attention contribution is unaffected either way.
+    early_exit = False,            # inference-time flag; pass --early_exit to render.py
+
+    # ---- losses ----
+    # L_flow replaces L_bind: the mask is bound to real image-space motion
+    # instead of to the raw amplitude of dx.
+    # L_flow is in normalized image units (1.0 = full image side). The scene is
+    # mostly static, so the mean over pixels is small -- watch fine/flow/epe_px
+    # rather than the loss value when tuning this.
+    lambda_flow = 10.0,
+    lambda_flow_velocity = 0.0,
+    flow_from_iter = 0,        # L_flow phai bat ngay: no la nguon giam sat DUY NHAT cua dx
+    flow_interval = 1,         # raise to 2-4 if the extra pass is too slow
+    flow_alpha_threshold = 0.5,
+
+    lambda_motion_sparse = 0.0,
+    lambda_motion_bind = 0.0,  # superseded by L_flow -- set >0 only for the ablation
+    lambda_motion_smooth = 0.0,
+    motion_bind_gamma = 10.0,
+    motion_mask_epsilon = 0.05,
+    motion_smooth_knn = 8,
+    motion_smooth_sample = 4096,
+
+    # ---- two-stage protocol ----
+    # Stage 1 (fine iters 0-3000): m_i pinned to 1, learn the canonical motion field.
+    # Stage 2 (3000+):             mask + cross-attention + L_flow + L_sparse active.
+    mask_warmup_iters = 0,     # pure KHONG co mask -> tham so nay chi con tac dung
+                               # chan L_flow. Voi detach_rgb=True thi dx khong nhan
+                               # gradient tu dau ca trong giai doan do -> dong bang.
+    freeze_grid_from_iter = 0, # set to 3000 for the paper's literal Stage 2 (freeze the
+                               # appearance HexPlane); required if flow_attn_detach='full'.
+)
+OptimizationParams = dict(
+    dataloader=True,
+    iterations = 15_000,
+    batch_size=1,
+    coarse_iterations = 3_000,
+    densify_until_iter = 10_000,
+    opacity_reset_interval = 100_000,
+    opacity_threshold_coarse = 0.001,
+    opacity_threshold_fine_init = 0.001,
+    opacity_threshold_fine_after = 0.001,
+    opacity_lr = 0.02,
+    # pruning_interval = 2000
+)

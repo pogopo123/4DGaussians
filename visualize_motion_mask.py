@@ -39,7 +39,10 @@ def deform_at_time(gaussians, t):
     means3D_final, scales_final, rotations_final, opacity_final, shs_final = gaussians._deformation(
         means3D, gaussians._scaling, gaussians._rotation, gaussians._opacity, gaussians.get_features, time)
     motion_out = gaussians._deformation.deformation_net.motion_out
-    assert motion_out is not None, "motion_out is None - was the model trained with motion_mask=True?"
+    if motion_out is None:
+        # flow_gate=False / flow_split / flow_merge: khong co motion mask.
+        # Tra ve m=None; cac panel heat/dynamic/static se bi bo qua.
+        return means3D_final, scales_final, rotations_final, opacity_final, shs_final, None
     m = motion_out["score"].squeeze(-1)  # [N]
     return means3D_final, scales_final, rotations_final, opacity_final, shs_final, m
 
@@ -145,7 +148,11 @@ def run(dataset, hyperparam, iteration, epsilon, n_video_frames, cams_mode="vide
 
     # pick the heatmap normaliser once, from the mask at mid-sequence
     _, _, _, _, _, m_probe = deform_at_time(gaussians, get_cam(n_total // 2).time)
-    if heat_scale == "norm":
+    has_mask = m_probe is not None
+    if not has_mask:
+        print("model khong co motion mask -- chi xuat GT + render")
+        denom = 1.0
+    elif heat_scale == "norm":
         denom = max(m_probe.quantile(0.999).item(), 1e-6)
         print(f"heatmap normalised by q99.9(m) = {denom:.4f} "
               f"(raw max(m) = {m_probe.max().item():.4f}) -- colours are RELATIVE")
@@ -160,43 +167,48 @@ def run(dataset, hyperparam, iteration, epsilon, n_video_frames, cams_mode="vide
         cam = get_cam(i)
         t = cam.time
         mu, s, r, o, shs, m = deform_at_time(gaussians, t)
-        all_m[t] = m.cpu()
+        if m is not None: all_m[t] = m.cpu()
 
         rgb = rasterize(cam, gaussians, bg, mu, s, r, o, shs)
-        heat = rasterize(cam, gaussians, black, mu, s, r, o, shs, colors_precomp=heat_colors(m, denom))
-        dyn = rasterize(cam, gaussians, black, mu, s, r, o, shs, point_mask=(m > epsilon))
-        stat = rasterize(cam, gaussians, black, mu, s, r, o, shs, point_mask=(m <= epsilon))
-
-        panels = [rgb, heat, dyn, stat]
-        name = f"{tag}_t{t:.3f}_rgb_heat_dyn_static.png"
+        panels = [rgb]
+        name = f"{tag}_t{t:.3f}_rgb.png"
+        if has_mask:
+            panels += [rasterize(cam, gaussians, black, mu, s, r, o, shs, colors_precomp=heat_colors(m, denom)),
+                       rasterize(cam, gaussians, black, mu, s, r, o, shs, point_mask=(m > epsilon)),
+                       rasterize(cam, gaussians, black, mu, s, r, o, shs, point_mask=(m <= epsilon))]
+            name = f"{tag}_t{t:.3f}_rgb_heat_dyn_static.png"
         if has_gt:
             panels.insert(0, cam.original_image[:3].cuda())
-            name = f"{tag}_t{t:.3f}_gt_rgb_heat_dyn_static.png"
+            name = "gt_" + name
         row = np.concatenate([to8b(x).transpose(1, 2, 0) for x in panels], axis=1)
         imageio.imwrite(os.path.join(out_dir, name), row)
 
-        noise_ratio, mean_disagree = spatial_consistency(mu, m)
-        dyn_ratio = (m > epsilon).float().mean().item()
-        print(f"t={t:.3f}: dynamic ratio={dyn_ratio:.3f} | m mean={m.mean():.3f} "
-              f"| isolated-noise ratio={noise_ratio:.4f} | mean KNN disagreement={mean_disagree:.4f}")
+        if has_mask:
+            noise_ratio, mean_disagree = spatial_consistency(mu, m)
+            print(f"t={t:.3f}: dynamic ratio={(m > epsilon).float().mean().item():.3f} "
+                  f"| m mean={m.mean():.3f} | isolated-noise={noise_ratio:.4f}")
+        else:
+            print(f"t={t:.3f}: (khong co mask)")
 
     # ---------- 2. histogram ----------
-    fig, ax = plt.subplots(figsize=(7, 4.5))
-    for t, m in all_m.items():
+    if not all_m:
+        print("bo qua histogram (khong co mask)")
+    else:
+      fig, ax = plt.subplots(figsize=(7, 4.5))
+      for t, m in all_m.items():
         ax.hist(m.numpy(), bins=100, range=(0, 1), alpha=0.5, label=f"t={t:.2f}", log=True)
-    ax.axvline(epsilon, color="k", ls="--", lw=1, label=f"epsilon={epsilon}")
-    ax.set_xlabel("motion score $m_i$")
-    ax.set_ylabel("count (log)")
-    ax.set_title("Motion mask distribution (bimodal = good separation)")
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "motion_histogram.png"), dpi=150)
-    plt.close(fig)
+      ax.axvline(epsilon, color="k", ls="--", lw=1, label=f"epsilon={epsilon}")
+      ax.set_xlabel("motion score $m_i$")
+      ax.set_ylabel("count (log)")
+      ax.set_title("Motion mask distribution (bimodal = good separation)")
+      ax.legend()
+      fig.tight_layout()
+      fig.savefig(os.path.join(out_dir, "motion_histogram.png"), dpi=150)
+      plt.close(fig)
 
-    m_cat = torch.cat(list(all_m.values()))
-    lo, hi = (m_cat < 0.1).float().mean().item(), (m_cat > 0.9).float().mean().item()
-    mid = 1 - lo - hi
-    print(f"histogram: {lo*100:.1f}% of m<0.1, {hi*100:.1f}% of m>0.9, {mid*100:.1f}% in between")
+      m_cat = torch.cat(list(all_m.values()))
+      lo, hi = (m_cat < 0.1).float().mean().item(), (m_cat > 0.9).float().mean().item()
+      print(f"histogram: {lo*100:.1f}% m<0.1, {hi*100:.1f}% m>0.9, {(1-lo-hi)*100:.1f}% giua")
 
     # ---------- videos: rgb | heatmap | dynamic-only over time ----------
     step = max(1, n_total // n_video_frames)
@@ -205,9 +217,10 @@ def run(dataset, hyperparam, iteration, epsilon, n_video_frames, cams_mode="vide
         cam = get_cam(i)
         mu, s, r, o, shs, m = deform_at_time(gaussians, cam.time)
         rgb = rasterize(cam, gaussians, bg, mu, s, r, o, shs)
-        heat = rasterize(cam, gaussians, black, mu, s, r, o, shs, colors_precomp=heat_colors(m, denom))
-        dyn = rasterize(cam, gaussians, black, mu, s, r, o, shs, point_mask=(m > epsilon))
-        panels = [rgb, heat, dyn]
+        panels = [rgb]
+        if has_mask:
+            panels += [rasterize(cam, gaussians, black, mu, s, r, o, shs, colors_precomp=heat_colors(m, denom)),
+                       rasterize(cam, gaussians, black, mu, s, r, o, shs, point_mask=(m > epsilon))]
         if has_gt:
             panels.insert(0, cam.original_image[:3].cuda())
         row = np.concatenate([to8b(x).transpose(1, 2, 0) for x in panels], axis=1)
@@ -224,6 +237,9 @@ def run(dataset, hyperparam, iteration, epsilon, n_video_frames, cams_mode="vide
     print(f"video: {vid}  ({len(frames)} frames, {frames[0].shape[1]}x{frames[0].shape[0]})")
 
     # ---------- post-hoc TensorBoard events (motion_histogram over time) ----------
+    if not all_m:
+        print(f"\nAll outputs saved in {out_dir}")
+        return
     try:
         from torch.utils.tensorboard import SummaryWriter
         tb = SummaryWriter(os.path.join(dataset.model_path, "motion_viz_tb"))

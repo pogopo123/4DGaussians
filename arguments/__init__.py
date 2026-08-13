@@ -121,6 +121,10 @@ class ModelHiddenParams(ParamGroup):
         self.flow_net_width = 64 # width of the flow decoder MLP (velocity head / pure-flow mask ablation)
         self.flow_net_depth = 2 # depth of that MLP
         self.flow_velocity_head = True # extra head decoding an explicit 3D velocity from f_flow
+        self.flow_gate = True # False = no mask head at all: the flow branch only feeds the
+                              # cross-attention, deltas are applied ungated (Delta = delta).
+                              # Drops L_sparse/L_smooth and the early-exit pass with it, and
+                              # removes the amplitude throttling the gate currently causes.
         self.flow_mask_init_bias = 2.0 # bias of the mask head at init (sigmoid(2.0)~0.88)
         # Both HexPlanes are queried directly at (x,y,z,t); there is no Fourier
         # encoding of t. The Flow-HexPlane is supervised straight from the
@@ -140,6 +144,28 @@ class ModelHiddenParams(ParamGroup):
                                         # "full": detach the whole f_deform (the reference code) --
                                         # only valid together with freeze_grid_from_iter > 0.
                                         # "none": no stop-gradient at all.
+        # ---- F3GS-split: tách head theo ngữ nghĩa thuộc tính ----
+        # Flow-HexPlane  -> dx, dq   (SE(3): chuyển động cứng)
+        # App-HexPlane   -> ds, dopacity, dSH   (bức xạ + hình dạng nội tại)
+        # Không dùng cross-attention; hai nhánh nối nhau bằng sg(f_app) một chiều.
+        # ---- F3GS-merge: nối mọi đặc trưng nhánh rồi để một MLP tự học phân công ----
+        # h = MLP( concat(f_app, f_flow, ...) )  ->  5 head đọc chung h.
+        # Biểu đạt mạnh hơn split (split là một trường hợp riêng của nó), nhưng cả hai
+        # loss lại chạm cả hai grid -- không còn tách được gradient.
+        self.flow_merge = False
+        self.flow_merge_depth = 2 # số lớp của MLP hợp nhất
+
+        self.flow_split = False
+        self.flow_split_ctx = True # nhánh flow đọc thêm sg(f_app) làm ngữ cảnh hình học
+        self.flow_split_heads = "xq" # "xq": nhánh flow sinh dx và dq. "x": chỉ dx, còn dq
+                                     # chuyển sang nhánh app. Bắt buộc dùng "x" khi
+                                     # flow_split_detach_rgb=True, vì L_flow mù với phép xoay
+                                     # (bản đồ flow dựng từ TÂM Gaussian) nên dq sẽ chết hẳn.
+        self.flow_grid_tv = False # áp TV/smoothness lên cả Flow-HexPlane
+        self.flow_split_detach_rgb = False # detach dx/dq ở lượt RGB -> cô lập tuyệt đối,
+                                           # nhưng chuyển động mất ràng buộc ở vùng flow thiếu
+        self.lambda_dx_app = 0.0 # dự phòng, không dùng trong split (App không còn head vị trí)
+
         self.mask_from_fused = False # True = m_i reads the fused backbone (the paper diagram).
                                      # False = m_i stays a function of f_flow alone, which is what
                                      # makes the early-exit pass worth anything: the mask can then be

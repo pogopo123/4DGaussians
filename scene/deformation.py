@@ -54,6 +54,27 @@ class Deformation(nn.Module):
         # 'none' : gradients flow freely both ways.
         self.flow_attn_detach = str(getattr(self.args, "flow_attn_detach", "query"))
         self.mask_from_fused = bool(getattr(self.args, "mask_from_fused", True))
+        # flow_gate=False strips the mask head: the flow branch becomes a pure
+        # Key/Value source for the attention and nothing gates the deltas.
+        self.use_gate = self.use_flow_mask and bool(getattr(self.args, "flow_gate", True))
+        # F3GS-split: head chia theo ngữ nghĩa thuộc tính thay vì gộp chung một backbone.
+        #   Flow-HexPlane -> dx, dq  (SE(3))      App-HexPlane -> ds, dopacity, dSH
+        # Không có backbone/residual dùng chung, nên L_flow không còn đường về App-HexPlane.
+        self.use_flow_merge = self.use_flow_mask and bool(getattr(self.args, "flow_merge", False))
+        if self.use_flow_merge:
+            self.use_flow_attn = False
+        self.use_flow_split = self.use_flow_mask and bool(getattr(self.args, "flow_split", False))
+        if self.use_flow_split:
+            self.use_flow_attn = False          # attention nối hai nhánh bằng gradient
+        self.split_ctx = bool(getattr(self.args, "flow_split_ctx", True))
+        self.split_detach_rgb = bool(getattr(self.args, "flow_split_detach_rgb", False))
+        self.split_flow_heads = str(getattr(self.args, "flow_split_heads", "xq"))
+        if self.use_flow_split and self.split_detach_rgb and self.split_flow_heads != "x":
+            raise ValueError(
+                "flow_split_detach_rgb=True cần flow_split_heads='x': L_flow mù với phép "
+                "xoay (bản đồ flow dựng từ tâm Gaussian), nên nếu dq nằm ở nhánh flow mà "
+                "L_rgb bị detach thì dq không nhận gradient từ đâu cả.")
+        self.split_out = None
         # Early-exit render pass: skip the deformation heads for points the mask
         # calls static. Inference only -- it would break the gradient flow of
         # L_sparse, which needs m_i for every point.
@@ -95,6 +116,28 @@ class Deformation(nn.Module):
         self.shs_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 16*3))
         if self.use_motion_mask and not self.use_flow_mask:
             self.motion_head = nn.Linear(self.W, 1)
+        if self.use_flow_merge:
+            in_dim = self.W + sum(self.branch_dims())
+            depth = max(1, int(getattr(self.args, "flow_merge_depth", 2)))
+            layers = [nn.Linear(in_dim, self.W), nn.ReLU()]
+            for _ in range(depth - 1):
+                layers += [nn.Linear(self.W, self.W), nn.ReLU()]
+            self.merge_mlp = nn.Sequential(*layers)
+            print(f"[F3GS] flow_merge=True -- concat({in_dim}) -> MLP -> 5 head chung; "
+                  f"khong tach gradient")
+        if self.use_flow_split:
+            fd = self.flow_field.flow_grid.feat_dim
+            Wf = int(getattr(self.args, "flow_net_width", 64))
+            depth = max(1, int(getattr(self.args, "flow_net_depth", 2)))
+            in_dim = fd + (self.W if self.split_ctx else 0)
+            layers = [nn.Linear(in_dim, Wf), nn.ReLU()]
+            for _ in range(depth - 1):
+                layers += [nn.Linear(Wf, Wf), nn.ReLU()]
+            self.flow_trunk_split = nn.Sequential(*layers)
+            self.flow_dx = nn.Linear(Wf, 3)     # tịnh tiến
+            self.flow_dq = nn.Linear(Wf, 4)     # xoay
+            print("[F3GS] flow_split=True -- Flow-HexPlane -> (dx, dq),  "
+                  "App-HexPlane -> (ds, dopacity, dSH); khong co cross-attention")
         if self.use_flow_attn:
             self.fusion = CrossAttentionFusion(
                 embed_dim=self.W,
@@ -104,6 +147,9 @@ class Deformation(nn.Module):
                 width=self.W,
                 depth=int(getattr(self.args, "flow_attn_backbone_depth", 2)),
                 mask_init_bias=float(getattr(self.args, "flow_mask_init_bias", 2.0)))
+            if not self.use_gate:
+                print("[F3GS] flow_gate=False -- no motion mask; the Flow-HexPlane only "
+                      "supplies Key/Value to the cross-attention, deltas are ungated")
 
     def query_time(self, rays_pts_emb, scales_emb, rotations_emb, time_feature, time_emb):
 
@@ -151,6 +197,8 @@ class Deformation(nn.Module):
             # soft gate m_i in [0,1]; multiplies the deltas (canonical is kept when m_i -> 0)
             if self.use_flow_attn:
                 h, motion_score, velocity = self.fuse(hidden, rays_pts_emb, time_emb)
+                if motion_score is None:            # flow_gate=False: nothing to gate with
+                    return h, ones, None, velocity
                 if self.mask_warmup:
                     motion_score = ones
                 return h, ones, motion_score, velocity
@@ -187,6 +235,10 @@ class Deformation(nn.Module):
         res = hidden.detach() if self.flow_attn_detach == "full" else hidden
         fused = self.fusion(q, tokens, residual=res)
 
+        if not self.use_gate:
+            h, _ = self.gated_decoder(fused, with_mask=False)
+            return h, None, self.flow_field.velocity(xyz, t, feat)
+
         h, m_fused = self.gated_decoder(fused, with_mask=self.mask_from_fused)
         if self.mask_from_fused:
             motion_score = m_fused
@@ -204,6 +256,13 @@ class Deformation(nn.Module):
         Skips the scale/rotation/opacity/SH heads, whose outputs the flow pass
         would throw away anyway.
         """
+        if self.use_flow_merge:
+            h = self.merge_feature(rays_pts_emb, time_emb)
+            return rays_pts_emb[:, :3] if self.args.no_dx else rays_pts_emb[:, :3] + self.pos_deform(h)
+        if self.use_flow_split:
+            # lượt t+dt của bản đồ flow: chỉ nhánh động học nhận gradient
+            _, dx, _ = self.split_branches(rays_pts_emb, time_emb)
+            return rays_pts_emb[:, :3] if self.args.no_dx else rays_pts_emb[:, :3] + dx
         hidden = self.query_time(rays_pts_emb, None, None, None, time_emb)
         h, mask, motion_score, _ = self.motion_gate(hidden, rays_pts_emb, time_emb)
         if self.args.no_dx:
@@ -214,6 +273,12 @@ class Deformation(nn.Module):
         return rays_pts_emb[:, :3] * mask + dx
 
     def forward_dynamic(self,rays_pts_emb, scales_emb, rotations_emb, opacity_emb, shs_emb, time_feature, time_emb):
+        if self.use_flow_merge:
+            return self.forward_dynamic_merge(rays_pts_emb, scales_emb, rotations_emb,
+                                              opacity_emb, shs_emb, time_emb)
+        if self.use_flow_split:
+            return self.forward_dynamic_split(rays_pts_emb, scales_emb, rotations_emb,
+                                              opacity_emb, shs_emb, time_emb)
         # gated on grad-enabled rather than self.training: nothing in this repo
         # calls .eval(), whereas every render path runs under torch.no_grad()
         if self.early_exit and not torch.is_grad_enabled() and self.can_flow_first():
@@ -288,6 +353,82 @@ class Deformation(nn.Module):
 
         return pts, scales, rotations, opacity, shs
 
+    def branch_dims(self):
+        """Số chiều của từng nhánh phụ nối vào MLP hợp nhất.
+
+        Thêm một grid mới (ví dụ Depth-HexPlane) chỉ cần nối thêm feat_dim của nó
+        ở đây và thêm đặc trưng tương ứng trong `branch_features`.
+        """
+        return [self.flow_field.flow_grid.feat_dim]
+
+    def branch_features(self, xyz, t):
+        return [self.flow_field.features(xyz, t)]
+
+    def merge_feature(self, rays_pts_emb, time_emb):
+        """h = MLP( concat(f_app, f_flow, ...) ) -- đặc trưng chung cho cả 5 head."""
+        xyz, t = rays_pts_emb[:, :3], time_emb[:, :1]
+        hidden = self.query_time(rays_pts_emb, None, None, None, time_emb)
+        return self.merge_mlp(torch.cat([hidden] + self.branch_features(xyz, t), -1))
+
+    def forward_dynamic_merge(self, rays_pts_emb, scales_emb, rotations_emb,
+                              opacity_emb, shs_emb, time_emb):
+        h = self.merge_feature(rays_pts_emb, time_emb)
+        xyz = rays_pts_emb[:, :3]
+        pts = xyz if self.args.no_dx else xyz + self.pos_deform(h)
+        scales = (scales_emb[:, :3] if self.args.no_ds
+                  else scales_emb[:, :3] + self.scales_deform(h))
+        rotations = (rotations_emb[:, :4] if self.args.no_dr
+                     else rotations_emb[:, :4] + self.rotations_deform(h))
+        opacity = (opacity_emb[:, :1] if self.args.no_do
+                   else opacity_emb[:, :1] + self.opacity_deform(h))
+        shs = (shs_emb if self.args.no_dshs
+               else shs_emb + self.shs_deform(h).reshape([shs_emb.shape[0], 16, 3]))
+        self.motion_out = None
+        self.split_out = None
+        return pts, scales, rotations, opacity, shs
+
+    def split_branches(self, rays_pts_emb, time_emb):
+        """-> (hidden, dx, dq) cho nhánh split.
+
+        `hidden` là f_app (dùng cho các head diện mạo); `dx`, `dq` sinh hoàn toàn
+        từ Flow-HexPlane, chỉ đọc thêm sg(f_app) làm ngữ cảnh hình học nên không
+        có gradient nào chảy ngược về App-HexPlane qua đường đó.
+        """
+        xyz, t = rays_pts_emb[:, :3], time_emb[:, :1]
+        hidden = self.query_time(rays_pts_emb, None, None, None, time_emb)
+        feat = self.flow_field.features(xyz, t)
+        inp = torch.cat([feat, hidden.detach()], -1) if self.split_ctx else feat
+        h = self.flow_trunk_split(inp)
+        return hidden, self.flow_dx(h), self.flow_dq(h)
+
+    def forward_dynamic_split(self, rays_pts_emb, scales_emb, rotations_emb,
+                              opacity_emb, shs_emb, time_emb):
+        hidden, dx, dq = self.split_branches(rays_pts_emb, time_emb)
+        xyz = rays_pts_emb[:, :3]
+
+        # lượt RGB: các head diện mạo mở gradient, phần động học tuỳ cờ
+        dx_r = dx.detach() if self.split_detach_rgb else dx
+
+        pts = xyz if self.args.no_dx else xyz + dx_r
+        if self.args.no_dr:
+            rotations = rotations_emb[:, :4]
+        elif self.split_flow_heads == "x":
+            # dq về nhánh app: chỉ L_rgb quan sát được phép xoay
+            rotations = rotations_emb[:, :4] + self.rotations_deform(hidden)
+        else:
+            rotations = rotations_emb[:, :4] + (dq.detach() if self.split_detach_rgb else dq)
+        scales = (scales_emb[:, :3] if self.args.no_ds
+                  else scales_emb[:, :3] + self.scales_deform(hidden))
+        opacity = (opacity_emb[:, :1] if self.args.no_do
+                   else opacity_emb[:, :1] + self.opacity_deform(hidden))
+        shs = (shs_emb if self.args.no_dshs
+               else shs_emb + self.shs_deform(hidden).reshape([shs_emb.shape[0], 16, 3]))
+
+        # lượt FLOW dùng vị trí này: động học mở gradient, phần còn lại không liên quan
+        self.split_out = {"dx": dx, "dq": dq, "pos_flow": xyz + dx}
+        self.motion_out = None
+        return pts, scales, rotations, opacity, shs
+
     def can_flow_first(self):
         """Whether the mask can be evaluated without touching the appearance grid.
 
@@ -297,7 +438,7 @@ class Deformation(nn.Module):
         almost all of the deformation cost sits -- the head MLPs the plain
         early-exit skips are only a couple of percent of it.
         """
-        return (self.use_flow_attn and not self.mask_from_fused
+        return (self.use_flow_attn and self.use_gate and not self.mask_from_fused
                 and not self.mask_warmup and not self.args.no_dx)
 
     def forward_dynamic_flow_first(self, rays_pts_emb, scales_emb, rotations_emb,

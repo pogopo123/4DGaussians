@@ -535,8 +535,22 @@ class GaussianModel:
                     if weight.grad.mean() != 0:
                         print(name," :",weight.grad.mean(), weight.grad.min(), weight.grad.max())
         print("-"*50)
+    def _tv_grid_sets(self):
+        """Các bộ lưới chịu regularizer TV.
+
+        Mặc định chỉ App-HexPlane (như 4DGS gốc). Khi flow_grid_tv=True thì
+        Flow-HexPlane cũng được thêm vào -- cần thiết khi nhánh flow mang trường
+        dịch chuyển, vì optical flow prior chỉ phủ ~1.8% pixel nên phần còn lại
+        của trường không có ràng buộc nào.
+        """
+        net = self._deformation.deformation_net
+        sets = [net.grid.grids]
+        if getattr(net.args, "flow_grid_tv", False) and hasattr(net, "flow_field"):
+            sets.append(net.flow_field.flow_grid.grids)
+        return sets
+
     def _plane_regulation(self):
-        multi_res_grids = self._deformation.deformation_net.grid.grids
+        multi_res_grids = [g for s in self._tv_grid_sets() for g in s]
         total = 0
         # model.grids is 6 x [1, rank * F_dim, reso, reso]
         for grids in multi_res_grids:
@@ -548,7 +562,7 @@ class GaussianModel:
                 total += compute_plane_smoothness(grids[grid_id])
         return total
     def _time_regulation(self):
-        multi_res_grids = self._deformation.deformation_net.grid.grids
+        multi_res_grids = [g for s in self._tv_grid_sets() for g in s]
         total = 0
         # model.grids is 6 x [1, rank * F_dim, reso, reso]
         for grids in multi_res_grids:
@@ -561,7 +575,7 @@ class GaussianModel:
         return total
     def _l1_regulation(self):
                 # model.grids is 6 x [1, rank * F_dim, reso, reso]
-        multi_res_grids = self._deformation.deformation_net.grid.grids
+        multi_res_grids = [g for s in self._tv_grid_sets() for g in s]
 
         total = 0.0
         for grids in multi_res_grids:
